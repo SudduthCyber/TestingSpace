@@ -1,141 +1,109 @@
-import argparse
-import struct
 from impacket.smbconnection import SMBConnection
-from impacket.dcerpc.v5 import samr, dtypes, lsad, lsat
-from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
-from impacket.dcerpc.v5.rpcrt import DCERPCException
+from impacket.dcerpc.v5 import transport, lsad, lsat, samr, scmr
+from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+from impacket.dcerpc.v5.dtypes import *
+import argparse
+import sys
 
-class SmbAcls:
-    def __init__(self, server, share, username, password, domain="WORKGROUP"):
+class SMBACLManager:
+    def __init__(self, server, share, username, password, domain='', port=445):
         self.server = server
         self.share = share
         self.username = username
         self.password = password
         self.domain = domain
-        self.smb = None
+        self.port = port
+        self.smb_conn = None
+        self.dce = None
 
-    def connect(self):
-        """ Establish SMB connection """
+    def connect_smb(self):
+        """Establish an SMB connection."""
         try:
-            self.smb = SMBConnection(self.server, self.server)
-            self.smb.login(self.username, self.password, self.domain)
-            print(f"Connected to {self.server} as {self.username}")
+            self.smb_conn = SMBConnection(self.server, self.server, sess_port=self.port)
+            self.smb_conn.login(self.username, self.password, self.domain)
+            print(f"[+] Connected to SMB {self.server} on share {self.share}")
         except Exception as e:
-            print(f"Failed to connect: {e}")
-            exit(1)
+            print(f"[-] Failed to connect: {e}")
+            sys.exit(1)
 
-    def get_acl(self, path):
-        """ Fetch ACL information for a given file/folder """
+    def connect_lsarpc(self):
+        """Connect to LSARPC to query/set security descriptors."""
         try:
-            security_descriptor = self.smb.querySecurity(path, dtypes.OWNER_SECURITY_INFORMATION |
-                                                         dtypes.GROUP_SECURITY_INFORMATION |
-                                                         dtypes.DACL_SECURITY_INFORMATION)
-            return self._parse_acl(security_descriptor)
-        except DCERPCException as e:
-            print(f"Error retrieving ACLs: {e}")
-            return None
+            self.connect_smb()
+            rpctransport = transport.SMBTransport(self.server, self.port, r"lsarpc", smb_connection=self.smb_conn)
+            self.dce = rpctransport.get_dce_rpc()
+            self.dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+            self.dce.connect()
+            self.dce.bind(lsad.MSRPC_UUID_LSAD)
+            print("[+] Bound to LSARPC (Local Security Authority)")
+        except Exception as e:
+            print(f"[-] Failed to connect to LSARPC: {e}")
+            sys.exit(1)
 
-    def set_acl(self, path, sid, permissions, action="add"):
-        """ Modify ACL: Add/Remove entries """
+    def get_acl(self, filename):
+        """Retrieve ACLs of a file using LSARPC."""
         try:
-            security_descriptor = self.smb.querySecurity(path, dtypes.DACL_SECURITY_INFORMATION)
-            dacl = self._modify_acl(security_descriptor, sid, permissions, action)
-            self.smb.setSecurity(path, dtypes.DACL_SECURITY_INFORMATION, dacl)
-            print(f"ACL {action}ed for {sid} with permissions {permissions}")
-        except DCERPCException as e:
-            print(f"Error modifying ACL: {e}")
+            self.connect_lsarpc()
 
-    def _parse_acl(self, security_descriptor):
-        """ Decode ACLs from security descriptor """
-        if not security_descriptor:
-            return "No ACL entries found."
+            # Open LSA Policy
+            policy_handle = lsad.hLsarOpenPolicy2(self.dce, MAXIMUM_ALLOWED_ACCESS)['PolicyHandle']
 
-        dacl_data = security_descriptor['Dacl']['Data']
-        acl_entries = []
+            # Query Security Descriptor
+            response = lsad.hLsarQuerySecurityObject(
+                self.dce, policy_handle, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+            )
+            security_descriptor = response['SecurityDescriptor']
 
-        offset = 0
-        ace_count = struct.unpack('<H', dacl_data[2:4])[0]
-        
-        for _ in range(ace_count):
-            ace_type = dacl_data[offset]
-            access_mask = struct.unpack('<I', dacl_data[offset + 4:offset + 8])[0]
-            sid = self._parse_sid(dacl_data[offset + 8:])
-            acl_entries.append(f"{sid} - {access_mask}")
-            offset += 12  # Approximate ACE entry length
+            print(f"[+] ACL for {filename}: {security_descriptor}")
+        except Exception as e:
+            print(f"[-] Error retrieving ACL: {e}")
+        finally:
+            self.smb_conn.logoff()
+            self.dce.disconnect()
 
-        return acl_entries
+    def set_acl(self, filename, new_acl):
+        """Set ACLs on a file using LSARPC."""
+        try:
+            self.connect_lsarpc()
 
-    def _modify_acl(self, security_descriptor, sid, permissions, action):
-        """ Modify ACL entry """
-        dacl_data = security_descriptor['Dacl']['Data']
-        new_ace = self._encode_ace(sid, permissions)
+            # Open LSA Policy
+            policy_handle = lsad.hLsarOpenPolicy2(self.dce, MAXIMUM_ALLOWED_ACCESS)['PolicyHandle']
 
-        if action == "add":
-            return dacl_data + new_ace
-        elif action == "remove":
-            return dacl_data.replace(new_ace, b"")
-        
-        return dacl_data
+            # Convert new ACL from SDDL format
+            security_descriptor = SR_SECURITY_DESCRIPTOR()
+            security_descriptor.fromString(new_acl)
 
-    def _parse_sid(self, data):
-        """ Convert binary SID to string """
-        sub_auth_count = data[1]
-        sid_str = f"S-{data[0]}"
-        sid_str += f"-{struct.unpack('<I', data[2:6])[0]}"
-        for i in range(sub_auth_count):
-            sid_str += f"-{struct.unpack('<I', data[6 + (i * 4):10 + (i * 4)])[0]}"
-        return sid_str
+            # Set the new ACL
+            lsad.hLsarSetSecurityObject(
+                self.dce, policy_handle, DACL_SECURITY_INFORMATION, security_descriptor
+            )
+            print(f"[+] Successfully set ACL on {filename}")
+        except Exception as e:
+            print(f"[-] Error setting ACL: {e}")
+        finally:
+            self.smb_conn.logoff()
+            self.dce.disconnect()
 
-    def _encode_ace(self, sid, permissions):
-        """ Encode ACE for adding new ACL """
-        ace_type = 0x00  # Access Allowed ACE
-        ace_flags = 0x00
-        access_mask = struct.pack('<I', permissions)
-        sid_bytes = self._sid_to_bytes(sid)
-
-        return struct.pack('<BBHI', ace_type, ace_flags, len(sid_bytes) + 8, access_mask) + sid_bytes
-
-    def _sid_to_bytes(self, sid):
-        """ Convert string SID to binary format """
-        parts = sid.split('-')
-        revision = int(parts[1])
-        identifier = struct.pack('<I', int(parts[2]))
-        sub_authorities = [struct.pack('<I', int(x)) for x in parts[3:]]
-
-        return bytes([revision, len(sub_authorities)]) + identifier + b''.join(sub_authorities)
-
-    def close(self):
-        """ Close SMB session """
-        if self.smb:
-            self.smb.logoff()
-            print("Disconnected from SMB.")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Python SMB ACLs management with Impacket")
-    parser.add_argument("server", help="SMB Server")
-    parser.add_argument("share", help="SMB Share")
-    parser.add_argument("username", help="Username")
-    parser.add_argument("password", help="Password")
-    parser.add_argument("path", help="File/Folder path in share")
-    parser.add_argument("--get", action="store_true", help="Get ACLs")
-    parser.add_argument("--set", nargs=2, metavar=('SID', 'PERMISSIONS'), help="Set ACL")
-    parser.add_argument("--remove", metavar='SID', help="Remove ACL for SID")
+def main():
+    parser = argparse.ArgumentParser(description="SMB ACL Management using Impacket")
+    parser.add_argument("server", help="SMB Server IP or Hostname")
+    parser.add_argument("share", help="SMB Share Name")
+    parser.add_argument("filename", help="File or Directory to query/set ACLs")
+    parser.add_argument("username", help="Username for authentication")
+    parser.add_argument("password", help="Password for authentication")
+    parser.add_argument("--get", action="store_true", help="Retrieve ACLs")
+    parser.add_argument("--set", metavar="NEW_ACL", help="Set new ACL (SDDL format)")
 
     args = parser.parse_args()
-    smb_acls = SmbAcls(args.server, args.share, args.username, args.password)
-    
-    try:
-        smb_acls.connect()
 
-        if args.get:
-            print("ACLs:", smb_acls.get_acl(args.path))
-        
-        if args.set:
-            sid, perms = args.set
-            smb_acls.set_acl(args.path, sid, int(perms), "add")
+    manager = SMBACLManager(args.server, args.share, args.username, args.password)
 
-        if args.remove:
-            smb_acls.set_acl(args.path, args.remove, 0, "remove")
+    if args.get:
+        manager.get_acl(args.filename)
+    elif args.set:
+        manager.set_acl(args.filename, args.set)
+    else:
+        print("Specify --get to retrieve ACLs or --set <SDDL> to set ACLs.")
 
-    finally:
-        smb_acls.close()
+if __name__ == "__main__":
+    main()
