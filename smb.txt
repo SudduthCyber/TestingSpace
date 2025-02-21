@@ -1,0 +1,71 @@
+from impacket.smbconnection import SMBConnection
+from impacket.dcerpc.v5 import dtypes, samr, lsad, lsat, scmr
+from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+from impacket.dcerpc.v5.transport import SMBTransport
+import argparse
+
+class SMBACLManager:
+    def __init__(self, server, share, username, password, domain='', port=445):
+        self.server = server
+        self.share = share
+        self.username = username
+        self.password = password
+        self.domain = domain
+        self.port = port
+        self.smb_conn = None
+
+    def connect(self):
+        """Establish an SMB connection."""
+        self.smb_conn = SMBConnection(self.server, self.server, sess_port=self.port)
+        self.smb_conn.login(self.username, self.password, self.domain)
+        print(f"Connected to {self.server} on share {self.share}")
+
+    def get_acl(self, filename):
+        """Retrieve ACLs of a file."""
+        try:
+            self.connect()
+            security_descriptor = self.smb_conn.querySecurityDescriptor(self.share, filename)
+            print(f"ACL for {filename}: {security_descriptor}")
+        except Exception as e:
+            print(f"Error retrieving ACL: {e}")
+        finally:
+            self.smb_conn.logoff()
+
+    def set_acl(self, filename, new_acl):
+        """Set ACLs on a file."""
+        try:
+            self.connect()
+            # Assume new_acl is an SDDL string, convert it to security descriptor
+            security_descriptor = dtypes.SR_SECURITY_DESCRIPTOR()
+            security_descriptor.fromString(new_acl)
+
+            self.smb_conn.setSecurityDescriptor(self.share, filename, security_descriptor)
+            print(f"Successfully set ACL on {filename}")
+        except Exception as e:
+            print(f"Error setting ACL: {e}")
+        finally:
+            self.smb_conn.logoff()
+
+def main():
+    parser = argparse.ArgumentParser(description="SMB ACL Management using Impacket")
+    parser.add_argument("server", help="SMB Server IP or Hostname")
+    parser.add_argument("share", help="SMB Share Name")
+    parser.add_argument("filename", help="File or Directory to query/set ACLs")
+    parser.add_argument("username", help="Username for authentication")
+    parser.add_argument("password", help="Password for authentication")
+    parser.add_argument("--get", action="store_true", help="Retrieve ACLs")
+    parser.add_argument("--set", metavar="NEW_ACL", help="Set new ACL (SDDL format)")
+
+    args = parser.parse_args()
+
+    manager = SMBACLManager(args.server, args.share, args.username, args.password)
+
+    if args.get:
+        manager.get_acl(args.filename)
+    elif args.set:
+        manager.set_acl(args.filename, args.set)
+    else:
+        print("Specify --get to retrieve ACLs or --set <SDDL> to set ACLs.")
+
+if __name__ == "__main__":
+    main()
